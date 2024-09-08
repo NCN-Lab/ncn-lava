@@ -14,7 +14,8 @@ from lava.magma.core.resources import CPU
 from lava.magma.core.decorator import implements, requires, tag
 from lava.magma.core.model.py.model import PyLoihiProcessModel
 from lava.proc.lif.process import (LIF, LIFReset, TernaryLIF, LearningLIF,
-                                   LIFRefractory)
+                                   LIFRefractory, ConfigTimeConstantsLIF, 
+                                   ConfigTimeConstantsRefractoryLIF)
 
 
 class AbstractPyLifModelFloat(PyLoihiProcessModel):
@@ -502,6 +503,136 @@ class PyLifRefractoryModelFloat(AbstractPyLifModelFloat):
         self.s_out.send(s_out)
 
 
+@implements(proc=LIFRefractory, protocol=LoihiProtocol)
+@requires(CPU)
+@tag("bit_accurate_loihi", "fixed_pt")
+class PyLifRefractoryModelBitAcc(AbstractPyLifModelFixed):
+    """Implementation of Leaky-Integrate-and-Fire neural process with refractory
+    period in bit-accurate precision with Loihi's hardware LIF dynamics, 
+    which means, it mimics Loihi behaviour.
+
+    Precisions of state variables
+
+    - du: unsigned 12-bit integer (0 to 4095)
+    - dv: unsigned 12-bit integer (0 to 4095)
+    - bias_mant: signed 13-bit integer (-4096 to 4095). Mantissa part of neuron
+      bias.
+    - bias_exp: unsigned 3-bit integer (0 to 7). Exponent part of neuron bias.
+    - vth: unsigned 17-bit integer (0 to 131071).
+
+    """
+
+    s_out: PyOutPort = LavaPyType(PyOutPort.VEC_DENSE, np.int32, precision=24)
+    vth: int = LavaPyType(int, np.int32, precision=17)
+    refractory_period_end: np.ndarray = LavaPyType(np.ndarray, np.int32, precision=24)
+
+    def __init__(self, proc_params):
+        super(PyLifRefractoryModelBitAcc, self).__init__(proc_params)
+        self.effective_vth = 0
+
+        self.refractory_period = proc_params["refractory_period"]
+        # self.reset_interval = proc_params["reset_interval"]
+        # self.reset_offset = (proc_params["reset_offset"]) % self.reset_interval
+
+    def scale_threshold(self):
+        """Scale threshold according to the way Loihi hardware scales it. In
+        Loihi hardware, threshold is left-shifted by 6-bits to MSB-align it
+        with other state variables of higher precision.
+        """
+        self.effective_vth = np.left_shift(self.vth, self.vth_shift)
+        self.isthrscaled = True
+
+    def spiking_activation(self):
+        """Spike when voltage exceeds threshold."""
+        return self.v > self.effective_vth
+
+    def subthr_dynamics(self, activation_in: np.ndarray):
+        """Sub-threshold dynamics of current and voltage variables for
+        all refractory LIF models. This is where the 'leaky integration'
+        happens.
+        """
+        # TODO: Validate
+        # Update current
+        # --------------
+        decay_const_u = self.du + self.ds_offset
+        # Below, u is promoted to int64 to avoid overflow of the product
+        # between u and decay constant beyond int32. Subsequent right shift by
+        # 12 brings us back within 24-bits (and hence, within 32-bits)
+        decayed_curr = np.int64(self.u) * (self.decay_unity - decay_const_u)
+        decayed_curr = np.sign(decayed_curr) * np.right_shift(
+            np.abs(decayed_curr), self.decay_shift
+        )
+        decayed_curr = np.int32(decayed_curr)
+        # Hardware left-shifts synaptic input for MSB alignment
+        activation_in = np.left_shift(activation_in, self.act_shift)
+        # Add synptic input to decayed current
+        decayed_curr += activation_in
+        # Check if value of current is within bounds of 24-bit. Overflows are
+        # handled by wrapping around modulo 2 ** 23. E.g., (2 ** 23) + k
+        # becomes k and -(2**23 + k) becomes -k
+        wrapped_curr = np.where(
+            decayed_curr > self.max_uv_val,
+            decayed_curr - 2 * self.max_uv_val,
+            decayed_curr,
+        )
+        wrapped_curr = np.where(
+            wrapped_curr <= -self.max_uv_val,
+            decayed_curr + 2 * self.max_uv_val,
+            wrapped_curr,
+        )
+        self.u[:] = wrapped_curr
+
+        # Update voltage
+        # --------------
+        # Check if the neuron is in refractory period
+        non_refractory = self.refractory_period_end < self.time_step
+        
+        decay_const_v = self.dv + self.dm_offset
+
+        neg_voltage_limit = -np.int32(self.max_uv_val) + 1
+        pos_voltage_limit = np.int32(self.max_uv_val) - 1
+        # Decaying voltage similar to current. See the comment above to
+        # understand the need for each of the operations below.
+        decayed_volt = np.int64(self.v[non_refractory]) * (self.decay_unity - decay_const_v)
+        decayed_volt = np.sign(decayed_volt) * np.right_shift(
+            np.abs(decayed_volt), self.decay_shift
+        )
+        decayed_volt = np.int32(decayed_volt)
+        # effective_bias is an array of the same shape as v apparently
+        updated_volt = decayed_volt + self.u[non_refractory] + self.effective_bias[non_refractory]
+        self.v[non_refractory] = np.clip(updated_volt, neg_voltage_limit, pos_voltage_limit)
+        
+    def process_spikes(self, spike_vector: np.ndarray):
+        # TODO: Edit
+        self.refractory_period_end[spike_vector] = (self.time_step
+                                                    + self.refractory_period)
+        super().reset_voltage(spike_vector)
+
+    def run_spk(self):
+        """The run function that performs the actual computation during
+        execution orchestrated by a PyLoihiProcessModel using the
+        LoihiProtocol.
+        """
+        # Receive synaptic input
+        a_in_data = self.a_in.recv()
+
+        # # Compute effective bias and threshold only once, not every time-step
+        # if not self.isbiasscaled:
+        self.scale_bias()
+
+        if not self.isthrscaled:
+            self.scale_threshold()
+
+        self.subthr_dynamics(activation_in=a_in_data)
+
+        s_out = self.spiking_activation()
+
+        # Reset voltage of spiked neurons to 0
+        self.process_spikes(spike_vector=s_out)
+
+        self.s_out.send(s_out)        
+
+
 @implements(proc=LearningLIF, protocol=LoihiProtocol)
 @requires(CPU)
 @tag("bit_accurate_loihi", "fixed_pt")
@@ -559,3 +690,173 @@ class PyLearningLifModelFloat(LearningNeuronModelFloat,
         Dense process for learning.
         """
         super().run_spk()
+
+
+class AbstractPyConfigTimeConstantsLifModelFloat(PyLoihiProcessModel):
+    """Abstract implementation of floating point precision
+    configurable time constants leaky-integrate-and-fire neuron model.
+
+    Specific implementations inherit from here.
+    """
+
+    # a_in is the input port that receives the synaptic input.
+    # The positive values of a_in will increase the u_exc and negative values
+    # will increase the u_inh.
+    a_in: PyInPort = LavaPyType(PyInPort.VEC_DENSE, float)
+    s_out = None  # This will be an OutPort of different LavaPyTypes
+    u_exc: np.ndarray = LavaPyType(np.ndarray, float)
+    u_inh: np.ndarray = LavaPyType(np.ndarray, float)
+    u: np.ndarray = LavaPyType(np.ndarray, float)   # Net current (u_exc + u_inh)
+    v: np.ndarray = LavaPyType(np.ndarray, float)
+    bias_mant: np.ndarray = LavaPyType(np.ndarray, float)
+    bias_exp: np.ndarray = LavaPyType(np.ndarray, float)
+    du_exc: np.ndarray = LavaPyType(np.ndarray, float)
+    du_inh: np.ndarray = LavaPyType(np.ndarray, float)
+    dv: np.ndarray = LavaPyType(np.ndarray, float)
+
+    def spiking_activation(self):
+        """Abstract method to define the activation function that determines
+        how spikes are generated.
+        """
+        raise NotImplementedError(
+            "spiking activation() cannot be called from "
+            "an abstract ProcessModel"
+        )
+
+    def subthr_dynamics(self, activation_in: np.ndarray):
+        """Common sub-threshold dynamics of current and voltage variables for
+        all Configurable Time Constants LIF models. 
+        This is where the 'leaky integration' happens.
+        """
+        # Get the excitatory input from a_in -- Positive values increase u_exc
+        exc_a_in = np.clip(activation_in, a_min=0, a_max=None)
+        # Get the inhibitory input from a_in -- Negative values increase u_inh
+        inh_a_in = np.clip(activation_in, a_min=None, a_max=0)
+
+        # Update the excitatory and inhibitory currents
+        self.u_exc[:] = self.u_exc * (1 - self.du_exc)
+        self.u_exc[:] += exc_a_in
+
+        self.u_inh[:] = self.u_inh * (1 - self.du_inh)
+        self.u_inh[:] += inh_a_in
+
+        # Update the voltage
+        # Calculate the net current by adding the excitatory and inhibitory currents
+        self.u = self.u_exc + self.u_inh   # u_inh is negative
+        self.v[:] = self.v * (1 - self.dv) + self.u + self.bias_mant
+
+    def reset_voltage(self, spike_vector: np.ndarray):
+        """Voltage reset behaviour. This can differ for different neuron
+        models."""
+        self.v[spike_vector] = 0
+
+    def run_spk(self):
+        """The run function that performs the actual computation during
+        execution orchestrated by a PyLoihiProcessModel using the
+        LoihiProtocol.
+        """
+        super().run_spk()
+        a_in_data = self.a_in.recv()
+
+        self.subthr_dynamics(activation_in=a_in_data)
+        self.s_out_buff = self.spiking_activation()
+        self.reset_voltage(spike_vector=self.s_out_buff)
+        self.s_out.send(self.s_out_buff)
+
+@implements(proc=ConfigTimeConstantsLIF, protocol=LoihiProtocol)
+@requires(CPU)
+@tag("floating_pt")
+class PyConfigTimeConstantsLifFloat(AbstractPyConfigTimeConstantsLifModelFloat):
+    """Implementation of Configurable time constants Leaky-Integrate-and-Fire neural process in
+    floating  point precision. This short and simple ProcessModel can be used for quick
+    algorithmic prototyping, without engaging with the nuances of a fixed
+    point implementation.
+    """
+    # TODO: Could add refractory capability to this model
+    s_out: PyOutPort = LavaPyType(PyOutPort.VEC_DENSE, float)
+    vth: float = LavaPyType(float, float)
+    
+    def spiking_activation(self):
+        """Spiking activation function for LIF."""
+        return self.v > self.vth
+           
+@implements(proc=ConfigTimeConstantsRefractoryLIF, protocol=LoihiProtocol)
+@requires(CPU)
+@tag("floating_pt")
+class PyConfigTimeConstantsRefractoryLifFloat(AbstractPyConfigTimeConstantsLifModelFloat):
+    """Implementation of Configurable time constants Refractory Leaky-Integrate-and-Fire neural process in
+    floating  point precision. This short and simple ProcessModel can be used for quick
+    algorithmic prototyping, without engaging with the nuances of a fixed
+    point implementation.
+    """
+    s_out: PyOutPort = LavaPyType(PyOutPort.VEC_DENSE, float)
+    vth: float = LavaPyType(float, float)
+    refractory_period_end: np.ndarray = LavaPyType(np.ndarray, int)
+    
+    def __init__(self, proc_params):
+        super(PyConfigTimeConstantsRefractoryLifFloat, self).__init__(proc_params)
+        self.refractory_period = proc_params["refractory_period"]
+
+    def spiking_activation(self):
+        """Spiking activation function for LIF."""
+        return self.v > self.vth
+    
+    def subthr_dynamics(self, activation_in: np.ndarray):
+        """Sub-threshold dynamics of current and voltage variables for
+        ConfigTimeConstantsLIF
+        This is where the 'leaky integration' happens.
+        """
+        # if np.max(activation_in) > 0:
+        #     print(f"Time step: {self.time_step} has activation.")
+
+        # Get the excitatory input from a_in -- Positive values increase u_exc
+        exc_a_in = np.clip(activation_in, a_min=0, a_max=None)
+        # Get the inhibitory input from a_in -- Negative values increase u_inh
+        inh_a_in = np.clip(activation_in, a_min=None, a_max=0)
+
+        # Update the excitatory and inhibitory currents
+        self.u_exc[:] = self.u_exc * (1 - self.du_exc)
+        self.u_exc[:] += exc_a_in
+
+        self.u_inh[:] = self.u_inh * (1 - self.du_inh)
+        self.u_inh[:] += inh_a_in
+
+        # Check which neurons are not in refractory period
+        non_refractory = self.refractory_period_end < self.time_step
+        """ non_refrac_idx = np.where(non_refractory == False)[0]
+        if len(non_refrac_idx) > 0:
+            print(f"Time step: {self.time_step} has neurons in refractory period -> {non_refrac_idx}")
+            print(f"{self.u[non_refrac_idx[0]]} {self.v[non_refrac_idx[0]]}")  """
+
+        # Update the voltage of the non-refractory neurons
+        # Calculate the net current by adding the excitatory and inhibitory currents
+        self.u = self.u_exc + self.u_inh   # u_inh is negative
+
+        self.v[non_refractory] = self.v[non_refractory] * (1 - self.dv[non_refractory]) + (
+            self.u[non_refractory] + self.bias_mant[non_refractory])
+        
+    def process_spikes(self, spike_vector: np.ndarray):
+        """
+        Set the refractory_period_end for the neurons that spiked and
+        Reset the voltage of the neurons that spiked to 0
+        """
+        self.refractory_period_end[spike_vector] = (self.time_step
+                                                    + self.refractory_period)
+        super().reset_voltage(spike_vector)
+    
+    def run_spk(self):
+        """The run function that performs the actual computation during
+        execution orchestrated by a PyLoihiProcessModel using the
+        LoihiProtocol.
+        """
+        a_in_data = self.a_in.recv()
+
+        self.subthr_dynamics(activation_in=a_in_data)
+        spike_vector = self.spiking_activation()
+        """ if np.max(spike_vector) > 0:
+            print(f"Time step: {self.time_step} has a neuron spike.") """
+
+        self.process_spikes(spike_vector=spike_vector)    # Reset voltage of spiked neurons to 0 and update refractory period
+        self.s_out.send(spike_vector)
+
+    # TODO: Implement the PyConfigTimeConstantsLifFixed model (fixed point precision version)
