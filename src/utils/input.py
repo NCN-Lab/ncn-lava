@@ -47,6 +47,8 @@ class BaselineAlgorithm:
     SIXTY_PERC = "60perc"
     SIXTY_FIVE_PERC = "65perc"
     SEVENTY_PERC = "70perc"
+    EIGHTY_PERC = "80perc"
+    NINETY_PERC = "90perc"
 
 
 # Auxiliar method to check if the label has an HFO event
@@ -114,11 +116,27 @@ def band_to_confidence_window(band: MarkerType):
     else:
         raise ValueError("Unknown band type on band_to_confidence_window()")
     
+def band_to_avg_duration(band: MarkerType):
+    """
+    This function returns the average event duration for the band.
+    If the band is unknown, it returns 0.
+    @band (MarkerType): The band to get the average duration for.
+    """
+    if band == MarkerType.RIPPLE:
+        return 60  # 60 ms
+    elif band == MarkerType.FAST_RIPPLE:
+        return 23   # 25 ms
+    elif band == MarkerType.BOTH:
+        return int((60+23)/2)  # Avg. of the 2 above ~ 41 ms
+    else:
+        raise ValueError("Unknown band type on band_to_avg_duration()")
+
 
 SAMPLING_RATE = 2048    # 2048 Hz
 INPUT_DURATION_S = 120    # 120 seconds
 INPUT_DURATION = INPUT_DURATION_S * (10**3)    # 120000 ms or 120 seconds
 NUM_SAMPLES = SAMPLING_RATE * INPUT_DURATION_S  # 2048 samples per second for 120 seconds
+NUM_CH_PER_SNR = 30  # Number of channels per SNR (Synthetic Dataset)
 
 X_STEP = 1/SAMPLING_RATE * (10**3)  # 0.48828125 ms
 
